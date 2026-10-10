@@ -5,9 +5,8 @@
 - 刷新: POST {API_BASE}/api/v1/auth/refresh body {refreshToken, grantType:"refresh_token"}
   （端点与请求体同 cline 源码 DEFAULT_AUTH_ENDPOINTS.refresh / refreshClineToken）
 - 刷新结果原子写回凭据文件 + 内存缓存 25 分钟
-- 实测结论：register 产物会被 chat 401，refresh 产物同样 401——chat 只认新鲜 device 流
-  token；所以 refresh 仅在拿到新 refreshToken 时落盘备用，chat 401 时不自动换票（避免
-  把有效 token 洗废），由用户重新走 oauth.py 授权。
+- chat 端点的 Authorization 必须带 `workos:` 前缀（见 server.py `_upstream_headers`）；
+  带前缀后 register/refresh 产物均可正常调用，无需重新 oauth。
 """
 import json
 import os
@@ -64,8 +63,8 @@ def token(force: bool = False) -> str:
 def refresh() -> str:
     """refreshToken 换新 accessToken；成功则原子写回并更新缓存。
 
-    注意（实测）：换出的 token 打 chat 仍可能 401（上游只认新鲜 device 流票），
-    所以本方法只做「尽力续期」，调用方不应假设 refresh 能解 401。
+    换出的 accessToken 带 `workos:` 前缀调用 chat 即可用（前缀见 server.py
+    `_upstream_headers`）；401 自愈依赖本方法正常工作。
     """
     data = _read_file()
     rt = data.get("refreshToken") or ""

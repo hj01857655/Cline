@@ -77,15 +77,17 @@ def login() -> dict:
         "refreshToken": tokens.get("refresh_token") or "",
     }, headers={"Content-Type": "application/json", "User-Agent": UA}, timeout=30)
     body = r.json() if r.content else {}
-    access = body.get("accessToken") or body.get("access_token")
+    # 上游 2026-10 起把 register 响应包了一层 {"data": {...}}，两种形态都兼容
+    inner = body.get("data") if isinstance(body.get("data"), dict) else body
+    access = inner.get("accessToken") or inner.get("access_token") or body.get("accessToken") or body.get("access_token")
     if r.status_code != 200 or not access:
         raise RuntimeError("register 失败 HTTP %s: %s" % (r.status_code, str(body)[:200]))
 
     creds = {
         "accessToken": access,
-        "refreshToken": body.get("refreshToken") or body.get("refresh_token") or tokens.get("refresh_token") or "",
+        "refreshToken": inner.get("refreshToken") or inner.get("refresh_token") or tokens.get("refresh_token") or "",
         "provider": "cline-pass",
-        "expiresAt": int(time.time()) + int(body.get("expiresIn") or 0),
+        "expiresAt": int(time.time()) + int(inner.get("expiresIn") or body.get("expiresIn") or 0),
     }
     os.makedirs(os.path.dirname(AUTH_STORE), exist_ok=True)
     with open(AUTH_STORE, "w", encoding="utf-8") as fh:

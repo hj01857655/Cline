@@ -125,9 +125,8 @@ def _model_refresh_loop() -> None:
 def _token_refresh_loop() -> None:
     """后台 token 刷新：每 30 分钟主动续期一次 refreshToken 链。
 
-    实测：chat 只认新鲜 device 流 token（refresh 票会被 401），所以这里不是
-    为了「续出可用票」，而是保持 credentials.json 的 refreshToken 链常新——
-    长期间隔下与官方 CLI 的凭据仓行为对齐，降低整链断掉的概率。
+    换出的 accessToken 带 `workos:` 前缀调用 chat 即可（见 `_upstream_headers`）；
+    本线程保持 accessToken 新鲜，chat 401 自愈依赖它。
     刷新失败只记日志，绝不打断服务（下次循环再试）。
     """
     while True:
@@ -162,8 +161,9 @@ def _auth_and_rid():
 
 
 def _upstream_headers() -> dict:
-    """身份头全套：上游对无身份头的请求 401（实测），齐全后 free 模型 200。"""
-    return {"Authorization": "Bearer " + credential.token(),
+    """身份头全套：上游 2025-09 起 Firebase→WorkOS 迁移后，Authorization 必须带
+    `workos:` 前缀（社区实锤，OmniRoute #3321 同款问题），否则 401 要求重登录。"""
+    return {"Authorization": "Bearer workos:" + credential.token(),
             "Content-Type": "application/json",
             "HTTP-Referer": "https://cline.bot", "X-Title": "Cline",
             "X-CLIENT-TYPE": "cline-sdk", "User-Agent": "Cline/2.6.9",
