@@ -1,0 +1,9 @@
+credentials.json
+credentials.json.tmp
+.env
+request.log*
+server.log*
+server_console.log*
+dumps/
+__pycache__/
+*.pyc

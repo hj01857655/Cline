@@ -1,0 +1,5 @@
+# 上游克隆（自带 .git，不入本仓库）
+cline/
+cline-plugins/
+node_modules/
+.breezell/
