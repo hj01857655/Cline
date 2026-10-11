@@ -84,6 +84,19 @@ def _dump_save(rid, kind, data):
     except OSError as e:
         logger.warning("[%s] 落盘失败: %s", rid, e)
 
+# ── rid 单调计数器（替代 time-based 生成：旧式 time.time()*10%10000 每 1000 秒循环
+# 撞名，r9983 曾在 09:43 与 09:59 各出现一次，导致按 rid 做的配对统计与 dump 落盘不可信）
+_seq_lock = threading.Lock()
+_req_seq = 0
+
+
+def _next_req_id():
+    global _req_seq
+    with _seq_lock:
+        _req_seq += 1
+        return "r%04d" % _req_seq
+
+
 app = Flask(__name__)
 
 # ── 免费模型清单（启动拉一次，后台 10 分钟刷新）────────────────────────────────
@@ -123,23 +136,25 @@ def _model_refresh_loop() -> None:
 
 
 def _token_refresh_loop() -> None:
-    """后台 token 刷新：每 30 分钟主动续期一次 refreshToken 链。
+    """后台 token 续期：每 30 分钟查一次，**临期才刷**。
 
-    换出的 accessToken 带 `workos:` 前缀调用 chat 即可（见 `_upstream_headers`）；
-    本线程保持 accessToken 新鲜，chat 401 自愈依赖它。
+    原先固定每 30 分钟无脑 refresh()，而 accessToken 实测只活 60 分钟
+    （JWT iat/exp 10:40:59 → 11:40:59），于是每轮都可能白刷一次；而磁盘 token 一旦
+    临期，真正触发刷新的反而是 401 自愈那条路径，刷新被砸在用户第一个请求上
+    （表现成"每次启动必刷新"）。现改为 ensure_fresh()：token 还新鲜就不碰上游。
     刷新失败只记日志，绝不打断服务（下次循环再试）。
     """
     while True:
         time.sleep(30 * 60)
         try:
-            credential.refresh()
+            credential.ensure_fresh()
         except Exception as e:
             logger.warning("[token] 后台刷新失败（下次循环再试）: %s", e)
 
 
 @app.before_request
 def _auth_and_rid():
-    g.rid = "r%04d" % int(time.time() * 10 % 10000)
+    g.rid = _next_req_id()
     g.t0 = time.time()
     if API_KEY and request.path != "/health":
         if request.headers.get("Authorization") != "Bearer " + API_KEY:
@@ -238,10 +253,15 @@ def chat():
         _dump_save(g.rid, "resp", body)
         return Response(body, status=200, content_type="application/json")
 
+    # 流式生成器在请求上下文销毁后才迭代，期间禁止访问 g.*，否则抛
+    # Working outside of application context（异常再被下面的 except 吞掉），
+    # 表现为日志只有 in: 没有 done:、客户端收到空内容。
+    rid, t0 = g.rid, g.t0
+    dump_on = DUMP_ON  # 流式攒帧于内存，流末一次性落盘（DUMP=0 时不攒）
+
     def generate():
         total = 0
         buf = []
-        dump_on = DUMP_ON  # 流式攒帧于内存，流末一次性落盘（DUMP=0 时不攒）
         try:
             for chunk in upstream.iter_content(chunk_size=None):
                 if chunk:
@@ -249,13 +269,35 @@ def chat():
                     if dump_on and total <= DUMP_MAX_BYTES:
                         buf.append(chunk)
                     yield chunk
-            logger.info("[%s] done: stream %dB %.1fs", g.rid, total, time.time() - g.t0)
+            logger.info("[%s] done: stream %dB %.1fs", rid, total, time.time() - t0)
             if dump_on and buf:
-                _dump_save(g.rid, "resp", b"".join(buf))
+                _dump_save(rid, "resp", b"".join(buf))
+        except GeneratorExit:
+            # 客户端主动断开（长流常见）。GeneratorExit 继承 BaseException，
+            # 不加这分支会被下面的 except 漏掉、也不留日志，排查时看不出是谁先走的。
+            logger.warning("[%s] client 断开: stream %dB %.1fs", rid, total, time.time() - t0)
+            raise
         except Exception as e:
-            logger.error("[%s] stream 中断: %s (%dB %.1fs)", g.rid, e, total, time.time() - g.t0)
+            logger.error("[%s] stream 中断: %s (%dB %.1fs)", rid, e, total, time.time() - t0)
+            # 断流时把已收到的部分落盘：正常路径只在流末 _dump_save，中途断了
+            # 就只剩 .req，2.8MB 证据全丢，下一次同样故障无从比对。
+            if dump_on and buf:
+                _dump_save(rid, "resp_partial", b"".join(buf))
+            # 裸掐断会让客户端把半截回答当完整结果。显式补错误帧 + [DONE]
+            # （与 CodeArts2api 的流内错误帧转 OpenAI 错误帧同一套约定）。
+            err = json.dumps({"error": {"message": "upstream stream ended prematurely: %s" % e,
+                                        "type": "upstream_error"}},
+                             ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            try:
+                yield b"data: " + err + b"\n\n"
+                yield b"data: [DONE]\n\n"
+            except GeneratorExit:
+                raise
 
-    return Response(generate(), status=200, content_type=upstream.headers.get("Content-Type", "text/event-stream"))
+    resp = Response(generate(), status=200, mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache, no-transform"
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
 
 
 if __name__ == "__main__":
@@ -266,6 +308,15 @@ if __name__ == "__main__":
         print("凭证不可用: %s" % error)
         print("请先登录：python oauth.py")
         sys.exit(1)
+    # 启动预检：磁盘 token 已临期就先续上，别等用户第一个请求吃 401 才刷
+    # （失败不阻断启动，交给 401 自愈路径兜底）
+    try:
+        if credential.ensure_fresh():
+            print("启动预检：token 临期，已提前刷新")
+        else:
+            print("启动预检：token 仍新鲜，跳过刷新")
+    except Exception as error:
+        print("启动预检刷新失败（不阻断，将由 401 自愈兜底）: %s" % error)
     _fetch_free_models()
     threading.Thread(target=_model_refresh_loop, daemon=True).start()
     threading.Thread(target=_token_refresh_loop, daemon=True).start()
