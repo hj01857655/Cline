@@ -99,39 +99,102 @@ def _next_req_id():
 
 app = Flask(__name__)
 
-# ── 免费模型清单（启动拉一次，后台 10 分钟刷新）────────────────────────────────
-_free_models = {"ids": [], "models": {}}
+# ── 免费模型清单（启动拉一次，后台 10 分钟刷新；落盘上次可用清单，冷启动不从空开始）──
+_free_models = {"ids": [], "models": {}, "fail_until": 0.0}
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FREE_CACHE = os.path.join(_HERE, "free_cache.json")
 
 
-def _fetch_free_models() -> None:
-    """拉 recommended-models：免费面 = body.free 数组（cline-free/* 前缀，无订阅可用）。
-    clinePass/* 是订阅内含面（无 ClinePass 订阅一律 403 ENTITLEMENT），不放行。"""
+def _free_ids_from_body(models):
+    """从 recommended-models 的 free 数组筛免费面 id 与目录。命名规则即免费面契约。"""
+    free_ids, catalog = [], {}
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id") or ""
+        if mid and (mid.startswith("cline-free/") or mid.endswith(":free")):
+            free_ids.append(mid)
+            catalog[mid] = m
+    return free_ids, catalog
+
+
+def _load_free_cache() -> None:
     try:
-        r = requests.get(API_BASE + MODELS_PATH,
-                         headers={"User-Agent": UA}, timeout=20)
-        body = r.json() if r.content else {}
-        models = body.get("free") or []
-        free_ids, catalog = [], {}
-        for m in models:
-            if not isinstance(m, dict):
-                continue
-            mid = m.get("id") or ""
-            if mid and (mid.startswith("cline-free/") or mid.endswith(":free")):
-                free_ids.append(mid)
-                catalog[mid] = m
-        if free_ids:
-            _free_models["ids"], _free_models["models"] = free_ids, catalog
-            logger.info("[models] 免费模型 %d 个: %s", len(free_ids), ", ".join(free_ids))
-        else:
-            logger.warning("[models] free 列表为空（HTTP %s，顶层键=%s）",
-                           r.status_code, list(body.keys())[:6])
+        with open(_FREE_CACHE, encoding="utf-8") as f:
+            data = json.load(f)
+        ids, catalog = _free_ids_from_body(data.get("models") or [])
+    except Exception:
+        return  # 无缓存或缓存损坏：首次启动本就如此，不是错误
+    if not ids:
+        return
+    _free_models["ids"], _free_models["models"] = ids, catalog
+    logger.info("[models] 用上次落盘清单 %d 个兜底", len(ids))
+
+
+def _save_free_cache(models) -> None:
+    try:
+        tmp = _FREE_CACHE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"at": int(time.time()), "models": models}, f)
+        os.replace(tmp, _FREE_CACHE)
     except Exception as e:
-        logger.warning("[models] 拉取失败: %s", e)
+        logger.warning("[models] 清单落盘失败（不影响转发）: %s", e)
+
+
+def _fetch_free_models(quick: bool = False) -> None:
+    """拉 recommended-models：免费面 = body.free 数组（cline-free/* 前缀，无订阅可用）。
+    clinePass/* 是订阅内含面（无 ClinePass 订阅一律 403 ENTITLEMENT），不放行。
+
+    `quick=True` 给请求路径用：只试一次、超时短、失败进退避窗口。实测这条 GET 的失败
+    是**成串来的**（坏窗口里连撞六次全挂，curl 走 SChannel 也挂），一次失败要 5~6s 才
+    返回；重试三轮会挂在用户请求上十几秒，比临时按命名兜底糟得多。
+
+    失败时**保留旧清单**不清空：清单空了会把合法免费模型一并拒掉（OpenCode2api 2026-10-13 00:25 的实况）。
+    """
+    if quick and time.time() < _free_models["fail_until"]:
+        return
+    attempts = 1 if quick else 3
+    timeout = 4 if quick else 20
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            r = requests.get(API_BASE + MODELS_PATH,
+                             headers={"User-Agent": UA}, timeout=timeout)
+            body = r.json() if r.content else {}
+            free_ids, catalog = _free_ids_from_body(body.get("free") or [])
+            if free_ids:
+                _free_models["ids"], _free_models["models"] = free_ids, catalog
+                _free_models["fail_until"] = 0.0
+                _save_free_cache(list(catalog.values()))
+                logger.info("[models] 免费模型 %d 个: %s", len(free_ids), ", ".join(free_ids))
+            else:
+                # 联系上上游了但免费面是空的（全转付费 / 命名规则变了筛空）：这同样是
+                # 可信答案，按空清单认，并给退避 —— 否则每条请求都会因为 `not ids`
+                # 再打一次上游，坏窗口外也会把日志刷成一条模样的空列表告警。
+                _free_models["fail_until"] = time.time() + 30
+                logger.warning("[models] free 列表为空（HTTP %s，顶层键=%s）；保留旧清单 %d 个",
+                               r.status_code, list(body.keys())[:6], len(_free_models["ids"]))
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < attempts - 1:
+                time.sleep(0.5 * (attempt + 1))
+    _free_models["fail_until"] = time.time() + 30
+    # 带异常类型：把网络错误和代码错误（清单结构变了、r.json() 的解析错）吞在同一句
+    # 「拉取失败」里，只打消息下次排查会认错方向。
+    logger.warning("[models] 拉取失败（试 %d 次）: %s: %s；保留旧清单 %d 个",
+                   attempts, type(last_err).__name__, last_err, len(_free_models["ids"]))
 
 
 def _model_refresh_loop() -> None:
+    """后台刷新：每 60s 醒一次。
+
+    原来是固定睡 600 再拉一次，一次失败要等满 10 分钟才有下一次机会，坏窗口能连撞
+    两三分钟。短周期轮询让失败后 60s 就能补上（这条链路没有 TTL 概念，60s 一次的
+    上游清单请求成本可以忽略）。
+    """
     while True:
-        time.sleep(600)
+        time.sleep(60)
         _fetch_free_models()
 
 
@@ -194,7 +257,7 @@ def health():
 @app.route("/v1/models")
 def models():
     if not _free_models["ids"]:
-        _fetch_free_models()
+        _fetch_free_models(quick=True)   # 客户端列模型不该被上游抖动拖住
     now = int(time.time())
     return jsonify(data=[{"id": mid, "object": "model", "created": now, "owned_by": "cline-free"}
                          for mid in _free_models["ids"]])
@@ -203,12 +266,15 @@ def models():
 def _model_free(model_id: str) -> bool:
     """免费面判定：仅 cline-free/*（或 *:free）。cline-pass/* 是订阅面，一律拒。"""
     if not _free_models["ids"]:
-        _fetch_free_models()
-    if not _free_models["ids"]:
-        return False  # 清单拉不到时宁拒不放，防误打订阅面扣费
-    return (model_id in _free_models["ids"]
-            or model_id.startswith("cline-free/")
-            or model_id.endswith(":free"))
+        _fetch_free_models(quick=True)
+    if _free_models["ids"]:
+        return (model_id in _free_models["ids"]
+                or model_id.startswith("cline-free/")
+                or model_id.endswith(":free"))
+    # 清单拉不到且无缓存：按命名规则兜底放行 —— 这条**不**违背「宁拒不放」。
+    # 订阅面 id（cline-pass/*、cline-cloud/*）匹配不上 cline-free/ 前缀也不带 :free
+    # 后缀，仍然被拒；真正被误杀的只有名字里就写着 free 的合法免费模型。
+    return (model_id.startswith("cline-free/") or model_id.endswith(":free"))
 
 
 @app.route("/v1/chat/completions", methods=["POST"])
@@ -317,7 +383,8 @@ if __name__ == "__main__":
             print("启动预检：token 仍新鲜，跳过刷新")
     except Exception as error:
         print("启动预检刷新失败（不阻断，将由 401 自愈兜底）: %s" % error)
-    _fetch_free_models()
+    _load_free_cache()        # 先用上次落盘的清单兜底，冷启动不从空清单开始
+    _fetch_free_models(quick=True)   # 启动只试一次 4s；补拉交给下面的后台线程
     threading.Thread(target=_model_refresh_loop, daemon=True).start()
     threading.Thread(target=_token_refresh_loop, daemon=True).start()
     print("OpenAI Base URL: http://%s:%s/v1（仅免费模型）" % (LISTEN_HOST, LISTEN_PORT))
