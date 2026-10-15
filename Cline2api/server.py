@@ -71,6 +71,10 @@ def _dump_trim():
             pass
 
 
+# dump 文件名前缀启动段：rid 每进程从 r0001 重新计数，旧版同名 rid 跳重启后直接覆盖旧证据
+_BOOT_TAG = time.strftime("%m%d-%H%M%S", time.localtime()) + "-p%d" % os.getpid()
+
+
 def _dump_save(rid, kind, data):
     """把请求/响应原文落盘到 dumps/<rid>.<kind>.txt（DUMP=0 时跳过）。"""
     if not DUMP_ON or not data:
@@ -79,7 +83,7 @@ def _dump_save(rid, kind, data):
         os.makedirs(DUMP_DIR, exist_ok=True)
         text = data if isinstance(data, str) else data.decode("utf-8", "replace")
         truncated = len(text) > DUMP_MAX_BYTES
-        path = os.path.join(DUMP_DIR, "%s.%s.txt%s" % (rid, kind, ".truncated" if truncated else ""))
+        path = os.path.join(DUMP_DIR, "%s.%s.%s.txt%s" % (_BOOT_TAG, rid, kind, ".truncated" if truncated else ""))
         with open(path, "w", encoding="utf-8") as f:
             f.write(text[:DUMP_MAX_BYTES])
         _dump_trim()
