@@ -2,15 +2,6 @@
 
 Cline 逆向调研成果，以及 LiteLLM 网关的免费层 OpenAI 兼容代理（`Cline2api`，端口 **8381**）。
 
-## 目录
-
-| 目录 | 内容 |
-| --- | --- |
-| [`Cline2api/`](Cline2api/) | 主产物：OpenAI 兼容代理（详见其 README） |
-| [`docs/`](docs/) | 桌面端前端布局与后端架构、逆向工具（Swagger/HEARTBEAT/gist/pastebin） |
-| `cline/` | Cline 客户端源码（analysis = 官方 SWE-bench analysis） |
-| `cline-plugins/` | 插件生态（core/Template），含 Internal (OSS) / Pro API 架构文档 |
-
 ## Cline2api 速览
 
 ```bash
