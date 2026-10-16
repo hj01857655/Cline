@@ -34,12 +34,14 @@ python oauth.py
 
 ## 免费模型清单
 
+<!-- FREE-MODELS:BEGIN -->
 | 模型 id | 名称 | 说明 |
 | --- | --- | --- |
 | `cline-free/nemotron-3.5-super-vl` | cline-free/nemotron-3.5-super-vl | NVIDIA’s latest model with 120B and fast output |
 | `cline-free/mimo-v2.6-flash` | Mimo V2.6 Flash | Mixture-of-Experts architecture with 309B total parameters |
 | `cline-free/muse-spark-1.3-contributor` | Muse Spark 1.3 Contributor | Meta’s multimodal reasoning model for experimentation, learning, and early-stage agentic, multi-agent, and coding workflows. |
 | `cline-free/solar-mini4` | Solar Mini 4 | Compact 35-billion parameter mixture-of-experts |
+<!-- FREE-MODELS:END -->
 
 ## API 接口
 
